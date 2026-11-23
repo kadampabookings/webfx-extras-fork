@@ -22,22 +22,36 @@ import java.util.concurrent.atomic.AtomicInteger;
  * contains all keys and can therefore be used on subsequent keys requests. This cache also prevents repeating
  * resource loading, including failed attempts.
  *
+ * <p>Several resource path patterns may be given, which are tried IN ORDER: all formats of the first pattern are
+ * attempted, and only once every one of them has come back missing is the next pattern tried. That order is the point
+ * — see {@link AstI18nProvider}, where it covers the move of the generated dictionaries into an .exe sub-package. The
+ * formats within one pattern are still attempted in parallel, as they always were, so this costs no extra round trip
+ * when the dictionaries are where they are expected.
+ *
+ * <p>Note that only a MISSING dictionary falls through to the next pattern. A dictionary that is found but does not
+ * parse fails the whole load, rather than being quietly replaced by an older copy of itself from the previous
+ * location.
+ *
  * @author Bruno Salmon
  */
 final class ResourceAstDictionaryLoader implements DictionaryLoader {
 
     private static final boolean CACHE_DICTIONARIES = true;
 
-    private final String astResourcePathWithLangPattern;
+    private final String[] astResourcePathWithLangPatterns;
     private final String[] supportedFormats;
     private final Map<Object /* lang */, Dictionary> dictionaryCache = new HashMap<>();
 
     ResourceAstDictionaryLoader(String astResourcePathWithLangPattern, String... supportedFormats) {
-        this.astResourcePathWithLangPattern = astResourcePathWithLangPattern;
+        this(new String[]{astResourcePathWithLangPattern}, supportedFormats);
+    }
+
+    ResourceAstDictionaryLoader(String[] astResourcePathWithLangPatterns, String... supportedFormats) {
+        this.astResourcePathWithLangPatterns = astResourcePathWithLangPatterns;
         this.supportedFormats = supportedFormats;
     }
 
-    private String getDictionaryResourcePath(Object lang, String format) {
+    private String getDictionaryResourcePath(String astResourcePathWithLangPattern, Object lang, String format) {
         String path = astResourcePathWithLangPattern;
         path = Strings.replaceAll(path, "{lang}", Strings.toString(lang));
         path = Strings.replaceAll(path, "{format}", Strings.toString(format));
@@ -49,10 +63,22 @@ final class ResourceAstDictionaryLoader implements DictionaryLoader {
         Dictionary cachedDictionary = dictionaryCache.get(lang);
         if (cachedDictionary != null)
             return Future.succeededFuture(cachedDictionary);
+        Future<Dictionary> future = loadDictionaryFromPattern(lang, 0);
+        for (int patternIndex = 1; patternIndex < astResourcePathWithLangPatterns.length; patternIndex++) {
+            int nextPatternIndex = patternIndex;
+            future = future.recover(cause -> cause instanceof DictionaryNotFoundException
+                    ? loadDictionaryFromPattern(lang, nextPatternIndex) // missing here, so try the next location
+                    : Future.failedFuture(cause)); // found but unusable: that is the answer, don't look elsewhere
+        }
+        return future;
+    }
+
+    private Future<Dictionary> loadDictionaryFromPattern(Object lang, int patternIndex) {
         Promise<Dictionary> promise = Promise.promise();
+        String astResourcePathWithLangPattern = astResourcePathWithLangPatterns[patternIndex];
         AtomicInteger failureCounter = new AtomicInteger();
         for (String format : supportedFormats) {
-            String dictionaryResourcePath = getDictionaryResourcePath(lang, format);
+            String dictionaryResourcePath = getDictionaryResourcePath(astResourcePathWithLangPattern, lang, format);
             Resource.loadText(dictionaryResourcePath, text -> {
                 if (text != null) { // null happens on JRE when resource doesn't exist
                     try {
@@ -65,13 +91,23 @@ final class ResourceAstDictionaryLoader implements DictionaryLoader {
                     }
                 } else { // null = resource not found
                     if (failureCounter.incrementAndGet() == supportedFormats.length)
-                        promise.tryFail("No dictionary found for language " + lang);
+                        promise.tryFail(new DictionaryNotFoundException("No dictionary found for language " + lang));
                 }
             }, e -> {
                 if (failureCounter.incrementAndGet() == supportedFormats.length)
-                    promise.tryFail(e);
+                    promise.tryFail(new DictionaryNotFoundException(Strings.toString(e)));
             });
         }
         return promise.future();
+    }
+
+    /**
+     * Marks the one failure that another resource path pattern may still answer: the dictionary was not there. Any
+     * other failure is about a dictionary that WAS there, so trying an older location would hide it.
+     */
+    private static final class DictionaryNotFoundException extends RuntimeException {
+        DictionaryNotFoundException(String message) {
+            super(message);
+        }
     }
 }
